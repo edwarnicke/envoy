@@ -25,7 +25,6 @@ class ThreadLocalHistogramImpl : public Histogram, public MetricImpl {
 public:
   ThreadLocalHistogramImpl(const std::string& name, std::string&& tag_extracted_name,
                            std::vector<Tag>&& tags);
-
   ~ThreadLocalHistogramImpl();
 
   void merge(histogram_t* target);
@@ -36,6 +35,8 @@ public:
    */
   void beginMerge() {
     // This switches the current_active_ between 1 and 0.
+    std::lock_guard<std::mutex> lock(lock_);
+    ASSERT(std::this_thread::get_id() == created_thread_id_);
     current_active_ = otherHistogramIndex();
   }
 
@@ -45,10 +46,11 @@ public:
 
 private:
   uint64_t otherHistogramIndex() const { return 1 - current_active_; }
-  uint64_t current_active_;
+  std::atomic<uint64_t> current_active_;
   histogram_t* histograms_[2];
   std::atomic<uint16_t> flags_;
   std::thread::id created_thread_id_;
+  std::mutex lock_;
 };
 
 typedef std::shared_ptr<ThreadLocalHistogramImpl> TlsHistogramSharedPtr;
@@ -62,13 +64,12 @@ class ParentHistogramImpl : public ParentHistogram, public MetricImpl {
 public:
   ParentHistogramImpl(const std::string& name, Store& parent, TlsScope& tlsScope,
                       std::string&& tag_extracted_name, std::vector<Tag>&& tags);
-
-  virtual ~ParentHistogramImpl();
+  ~ParentHistogramImpl();
 
   void addTlsHistogram(const TlsHistogramSharedPtr& hist_ptr);
-
   bool used() const override;
   void recordValue(uint64_t value) override;
+
   /**
    * This method is called during the main stats flush process for each of the histograms. It
    * iterates through the TLS histograms and collects the histogram data of all of them

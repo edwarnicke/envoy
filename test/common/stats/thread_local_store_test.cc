@@ -185,7 +185,7 @@ public:
   }
 
   histogram_t* makeHistogram(const std::vector<uint64_t>& values) {
-    histogram_t* histogram = hist_alloc();
+    histogram_t* histogram = hist_fast_alloc();
     for (uint64_t value : values) {
       hist_insert_intscale(histogram, value, 0, 1);
     }

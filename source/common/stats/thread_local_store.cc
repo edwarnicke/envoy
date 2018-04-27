@@ -105,9 +105,8 @@ void ThreadLocalStoreImpl::mergeHistograms(PostMergeCb merge_complete_cb) {
     merge_in_progress_ = true;
     tls_->runOnAllThreads(
         [this]() -> void {
-          for (ScopeImpl* scope : scopes_) {
-            for (const auto& name_histogram_pair :
-                 tls_->getTyped<TlsCache>().scope_cache_[scope].histograms_) {
+          for (const auto& scopes : tls_->getTyped<TlsCache>().scope_cache_) {
+            for (const auto& name_histogram_pair : scopes.second.histograms_) {
               const TlsHistogramSharedPtr& tls_hist = name_histogram_pair.second;
               tls_hist->beginMerge();
             }
@@ -268,19 +267,16 @@ Histogram& ThreadLocalStoreImpl::ScopeImpl::histogram(const std::string& name) {
 
   std::unique_lock<std::mutex> lock(parent_.lock_);
   ParentHistogramImplSharedPtr& central_ref = central_cache_.histograms_[final_name];
-
-  std::vector<Tag> tags;
-  std::string tag_extracted_name = parent_.getTagsForName(final_name, tags);
   if (!central_ref) {
-    // Since MetricImpl only has move constructor, we are explicitly copying here.
-    std::string central_tag_extracted_name(tag_extracted_name);
-    std::vector<Tag> central_tags(tags);
+    std::vector<Tag> tags;
+    std::string tag_extracted_name = parent_.getTagsForName(final_name, tags);
     central_ref.reset(new ParentHistogramImpl(final_name, parent_, *this,
-                                              std::move(central_tag_extracted_name),
-                                              std::move(central_tags)));
+                                              std::move(tag_extracted_name), std::move(tags)));
+    ENVOY_LOG(warn, "allocating central histogram {}", final_name);
   }
 
   if (tls_ref) {
+    ENVOY_LOG(warn, "setting TLS ref histogram {}", final_name);
     *tls_ref = central_ref;
   }
   return *central_ref;
@@ -302,6 +298,7 @@ Histogram& ThreadLocalStoreImpl::ScopeImpl::tlsHistogram(const std::string& name
   }
 
   std::unique_lock<std::mutex> lock(parent_.lock_);
+  ENVOY_LOG(warn, "allocating TLS histogram {}", name);
   std::vector<Tag> tags;
   std::string tag_extracted_name = parent_.getTagsForName(name, tags);
   TlsHistogramSharedPtr hist_tls_ptr = std::make_shared<ThreadLocalHistogramImpl>(
@@ -310,6 +307,7 @@ Histogram& ThreadLocalStoreImpl::ScopeImpl::tlsHistogram(const std::string& name
   parent.addTlsHistogram(hist_tls_ptr);
 
   if (tls_ref) {
+    ENVOY_LOG(warn, "setting TLS ref TLS histogram {}", name);
     *tls_ref = hist_tls_ptr;
   }
   return *hist_tls_ptr;
@@ -320,8 +318,8 @@ ThreadLocalHistogramImpl::ThreadLocalHistogramImpl(const std::string& name,
                                                    std::vector<Tag>&& tags)
     : MetricImpl(name, std::move(tag_extracted_name), std::move(tags)), current_active_(0),
       flags_(0), created_thread_id_(std::this_thread::get_id()) {
-  histograms_[0] = hist_alloc();
-  histograms_[1] = hist_alloc();
+  histograms_[0] = hist_fast_alloc();
+  histograms_[1] = hist_fast_alloc();
 }
 
 ThreadLocalHistogramImpl::~ThreadLocalHistogramImpl() {
@@ -330,12 +328,14 @@ ThreadLocalHistogramImpl::~ThreadLocalHistogramImpl() {
 }
 
 void ThreadLocalHistogramImpl::recordValue(uint64_t value) {
+  std::lock_guard<std::mutex> lock(lock_);
   ASSERT(std::this_thread::get_id() == created_thread_id_);
   hist_insert_intscale(histograms_[current_active_], value, 0, 1);
   flags_ |= Flags::Used;
 }
 
 void ThreadLocalHistogramImpl::merge(histogram_t* target) {
+  std::lock_guard<std::mutex> lock(lock_);
   histogram_t** other_histogram = &histograms_[otherHistogramIndex()];
   hist_accumulate(target, other_histogram, 1);
   hist_clear(*other_histogram);
@@ -345,8 +345,9 @@ ParentHistogramImpl::ParentHistogramImpl(const std::string& name, Store& parent,
                                          TlsScope& tls_scope, std::string&& tag_extracted_name,
                                          std::vector<Tag>&& tags)
     : MetricImpl(name, std::move(tag_extracted_name), std::move(tags)), parent_(parent),
-      tls_scope_(tls_scope), interval_histogram_(hist_alloc()), cumulative_histogram_(hist_alloc()),
-      interval_statistics_(interval_histogram_), cumulative_statistics_(cumulative_histogram_) {}
+      tls_scope_(tls_scope), interval_histogram_(hist_fast_alloc()),
+      cumulative_histogram_(hist_fast_alloc()), interval_statistics_(interval_histogram_),
+      cumulative_statistics_(cumulative_histogram_) {}
 
 ParentHistogramImpl::~ParentHistogramImpl() {
   hist_free(interval_histogram_);
